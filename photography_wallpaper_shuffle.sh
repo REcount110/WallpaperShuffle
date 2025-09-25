@@ -92,6 +92,11 @@ trap cleanup_and_exit EXIT TERM
 
 ERRORCOUNT=0
 
+is_screen_locked() {
+    # check GNOME status of lock
+    loginctl show-session $(loginctl | awk '/tty/ {print $1; exit}') -p Locked | grep -q 'yes'
+}
+
 while true; do
     # If we are using fallback but primary now has images, switch back (and allow deletion)
     if [ "$ALLOW_DELETE" = false ] && has_images "$FOLDER"; then
@@ -127,6 +132,12 @@ while true; do
     fi
 
     for photo in "${FILES[@]}"; do  
+        # Check lock status, skip change and count if locked
+        if is_screen_locked; then
+            echo "[info] $(date '+%F %T') - Screen is locked, skipping wallpaper change."
+            sleep 10
+            continue
+        fi
         photo=$(readlink -f "$photo")  
         count=$(awk -v f="$photo" '$1==f{print $2}' "$COUNT_FILE")
         [ -z "$count" ] && count=0
