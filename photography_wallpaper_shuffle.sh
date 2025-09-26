@@ -21,8 +21,14 @@ FOLDER="/home/rackell/myWallPaper/"
 
 # Fallback system folders (first one with images will be used)
 FALLBACK_DIRS=(/usr/share/backgrounds /usr/share/pixmaps)
-# Local count file
+# Local count file (stores: "<full path> <count>"; path may contain spaces; count is last field)
 COUNT_FILE="$HOME/myShell/.wallpaper_shuffle_count.txt"
+LOCK_FILE="${COUNT_FILE}.lock"
+
+# Exponential backoff settings for locked screen (in seconds)
+LOCK_SLEEP_INITIAL=10      # initial wait
+LOCK_SLEEP_MAX=600         # maximum wait (10 minutes)
+LOCK_SLEEP_CURRENT=$LOCK_SLEEP_INITIAL
 
 # Sanity checks
 if ! command -v gsettings >/dev/null 2>&1; then
@@ -82,9 +88,17 @@ fi
 
 mkdir -p "$(dirname "$COUNT_FILE")"
 touch "$COUNT_FILE"
+# Acquire exclusive lock for the whole runtime to avoid concurrent corruption
+exec 200>"$LOCK_FILE" || { echo "Cannot open lock file $LOCK_FILE" >&2; exit 1; }
+if ! flock -n 200; then
+    echo "Another instance is running (lock: $LOCK_FILE). Exiting." >&2
+    exit 0
+fi
 
 cleanup_and_exit() {
     [ -f "$COUNT_FILE.tmp" ] && rm -f "$COUNT_FILE.tmp"
+    # Release lock (fd 200 will close on exit). Optionally remove lock file.
+    # rm -f "$LOCK_FILE"  # uncomment if you prefer deleting the lock file each run
     echo "Wallpaper shuffle script exited."
     exit 0
 }
@@ -95,6 +109,38 @@ ERRORCOUNT=0
 is_screen_locked() {
     # check GNOME status of lock
     loginctl show-session $(loginctl | awk '/tty/ {print $1; exit}') -p Locked | grep -q 'yes'
+}
+
+# --- Count helper functions supporting paths with spaces ---
+get_photo_count() {
+    local photo="$1"
+    awk -v f="$photo" '
+        {
+            c=$NF; $NF=""; sub(/[ \t]+$/,"",$0); p=$0;
+            if(p==f){print c; exit}
+        }
+    ' "$COUNT_FILE"
+}
+
+update_photo_count() {
+    local photo="$1" newcount="$2"
+    awk -v f="$photo" -v nc="$newcount" '
+        {
+            c=$NF; $NF=""; sub(/[ \t]+$/,"",$0); p=$0;
+            if(p!=f) print p" "c;
+        }
+        END { print f" "nc }
+    ' "$COUNT_FILE" > "$COUNT_FILE.tmp" && mv "$COUNT_FILE.tmp" "$COUNT_FILE"
+}
+
+remove_photo_entry() {
+    local photo="$1"
+    awk -v f="$photo" '
+        {
+            c=$NF; $NF=""; sub(/[ \t]+$/,"",$0); p=$0;
+            if(p!=f) print p" "c;
+        }
+    ' "$COUNT_FILE" > "$COUNT_FILE.tmp" && mv "$COUNT_FILE.tmp" "$COUNT_FILE"
 }
 
 while true; do
@@ -132,17 +178,25 @@ while true; do
     fi
 
     for photo in "${FILES[@]}"; do  
-        # Check lock status, skip change and count if locked
+        # Exponential backoff while locked: skip change & counting
         if is_screen_locked; then
-            echo "[info] $(date '+%F %T') - Screen is locked, skipping wallpaper change."
-            sleep 10
+            echo "[info] $(date '+%F %T') - Screen locked, waiting ${LOCK_SLEEP_CURRENT}s (exp backoff)."
+            sleep "$LOCK_SLEEP_CURRENT"
+            # Increase wait time up to max
+            if [ "$LOCK_SLEEP_CURRENT" -lt "$LOCK_SLEEP_MAX" ]; then
+                LOCK_SLEEP_CURRENT=$(( LOCK_SLEEP_CURRENT * 2 ))
+                [ "$LOCK_SLEEP_CURRENT" -gt "$LOCK_SLEEP_MAX" ] && LOCK_SLEEP_CURRENT=$LOCK_SLEEP_MAX
+            fi
             continue
+        else
+            # Reset backoff after unlock
+            [ "$LOCK_SLEEP_CURRENT" -ne "$LOCK_SLEEP_INITIAL" ] && LOCK_SLEEP_CURRENT=$LOCK_SLEEP_INITIAL
         fi
-        photo=$(readlink -f "$photo")  
-        count=$(awk -v f="$photo" '$1==f{print $2}' "$COUNT_FILE")
-        [ -z "$count" ] && count=0
+    photo=$(readlink -f "$photo")  
+    count=$(get_photo_count "$photo")
+    [ -z "$count" ] && count=0
 
-        # Try to set wallpaper. Always set picture-uri; picture-uri-dark is optional.
+        # Try to set wallpaper. Only on SUCCESS do we increment display count.
         if gsettings set org.gnome.desktop.background picture-uri "file://$photo"; then
             ERRORCOUNT=0
             # Optional: set dark variant if supported (ignore errors)
@@ -151,16 +205,13 @@ while true; do
             fi
             # Ensure GNOME scales the wallpaper (ignore errors if unsupported)
             gsettings set org.gnome.desktop.background picture-options "scaled" >/dev/null 2>&1 || true
-            echo "[info] $(date '+%F %T') - set wallpaper: $photo (mode=$([ "$ALLOW_DELETE" = true ] && echo primary || echo fallback))"
-            # Increment display count
             newcount=$((count+1))
-            grep -vF "$photo" "$COUNT_FILE" > "$COUNT_FILE.tmp" && mv "$COUNT_FILE.tmp" "$COUNT_FILE"
-            echo "$photo $newcount" >> "$COUNT_FILE"
-            # Delete image and count after 5 displays (only for primary folder)
-            if [ "$newcount" -ge 5 ] && [ "$ALLOW_DELETE" = true ]; then
+            update_photo_count "$photo" "$newcount"
+            echo "[info] $(date '+%F %T') - set wallpaper: $photo (count=$newcount mode=$([ "$ALLOW_DELETE" = true ] && echo primary || echo fallback))"
+            # Delete image and count after 3 successful displays (only for primary folder)
+            if [ "$newcount" -ge 3 ] && [ "$ALLOW_DELETE" = true ]; then
                 rm -f "$photo"
-                grep -vF "$photo" "$COUNT_FILE" > "$COUNT_FILE.tmp" && mv "$COUNT_FILE.tmp" "$COUNT_FILE"
-                # Delete empty folders only under the primary(myWallPaper) folder
+                remove_photo_entry "$photo"
                 if [[ "$photo" == "$FOLDER"* ]]; then
                     find "$FOLDER" -type d -empty -delete
                 fi
@@ -168,8 +219,7 @@ while true; do
             fi
         else
             ((ERRORCOUNT++))
-            echo "Failed to set wallpaper: $photo" >> "$COUNT_FILE"
-            echo "[warn] gsettings failed to set picture-uri for: $photo" >&2
+            echo "[warn] gsettings failed to set picture-uri for: $photo (no count increment)" >&2
             if [ $((ERRORCOUNT * INTERVAL)) -gt 20 ]; then
                 cleanup_and_exit
             fi
